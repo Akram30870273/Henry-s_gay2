@@ -1,0 +1,862 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Daily Balance Calendar</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        :root {
+            font-family: 'Inter', sans-serif;
+        }
+        .calendar-grid {
+            display: grid;
+            grid-template-columns: repeat(7, minmax(0, 1fr));
+        }
+        /* Sophisticated Dark Mode Day Cells */
+        .day-cell {
+            /* Removed aspect-ratio to allow height to collapse to content */
+            border: 1px solid #374151; /* gray-700 border for dark mode */
+            transition: all 0.2s;
+            cursor: pointer;
+            user-select: none;
+            background-color: #1f2937; /* gray-800 */
+        }
+        .day-cell:hover:not(.empty-day) {
+            background-color: #374151; /* gray-700 on hover */
+        }
+        .selected-day {
+            outline: 3px solid #22d3ee; /* Bright Cyan-400 ring */
+            background-color: #14b8a61a; /* Subtle teal background */
+            position: relative;
+            z-index: 10;
+        }
+        /* Day Header Styling */
+        .calendar-grid > div:nth-child(-n+7) { 
+            background-color: #374151; /* gray-700 */
+            color: #e5e7eb; /* gray-200 */
+            text-shadow: 0 1px 1px rgba(0, 0, 0, 0.3);
+        }
+
+        .balance-amount {
+            /* Adjusted size for maximum compactness */
+            font-size: 0.75rem; /* xs */
+            font-weight: 600;
+        }
+        .positive {
+            color: #10b981; /* Emerald-500 */
+        }
+        .negative {
+            color: #f87171; /* Red-400 (lighter for dark background) */
+        }
+        /* Custom modal styles */
+        .modal-container {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.7);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 50;
+        }
+        .modal-content {
+            background-color: #f9fafb; /* Light gray content for contrast */
+            padding: 2rem;
+            border-radius: 0.75rem;
+            max-width: 90%;
+            width: 400px;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5); /* Stronger shadow */
+        }
+        /* Loader styles */
+        .loader {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #06b6d4; /* Cyan-500 */
+            border-radius: 50%;
+            width: 24px;
+            height: 24px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+    <!-- Load Firebase Scripts -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, collection, query, where, runTransaction, getDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // Use Debug logging for development
+        setLogLevel('Debug');
+
+        // --- GEMINI API SETUP ---
+        const apiKey = ""; // API key is left empty; Canvas environment provides it at runtime
+        const apiUrlBase = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+
+        // --- GLOBAL FIREBASE VARIABLES (MANDATORY) ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let app, db, auth;
+        let userId = null;
+        let currentMonthData = {}; // Stores all daily balances for the currently displayed month and future months
+        let currentMonth = new Date().getMonth();
+        let currentYear = new Date().getFullYear();
+        let selectedDate = null; // Date object for the currently selected day
+        let isAuthReady = false;
+        let currentSavingsBalance = 0; 
+        let currentDebtBalance = 0; // NEW STATE for debt
+
+        // Get UI Elements
+        const calendarGridEl = document.getElementById('calendar-grid');
+        const monthTitleEl = document.getElementById('month-title');
+        const monthlyBalanceEl = document.getElementById('monthly-balance');
+        const modalEl = document.getElementById('balance-modal');
+        const balanceInputEl = document.getElementById('balance-input');
+        const modalDateEl = document.getElementById('modal-date');
+        const loadingEl = document.getElementById('loading-indicator');
+        const userIdEl = document.getElementById('user-id-display');
+        const saveButton = document.getElementById('save-balance-btn');
+        const tipWidgetEl = document.getElementById('tip-widget'); 
+        const balanceWarningBannerEl = document.getElementById('balance-warning-banner');
+        const savingsWidgetEl = document.getElementById('savings-widget'); 
+        const savingsBalanceEl = document.getElementById('savings-balance'); 
+        const debtWidgetEl = document.getElementById('debt-widget'); // NEW WIDGET CONTAINER
+        const debtBalanceEl = document.getElementById('debt-balance'); // NEW BALANCE DISPLAY
+
+        // State to track what the modal is editing
+        let modalMode = 'daily'; // 'daily', 'savings', or 'debt'
+
+        // Utility functions
+        const daysOfWeek = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+        const months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+        
+        const formatDateKey = (date) => {
+            const y = date.getFullYear();
+            const m = String(date.getMonth() + 1).padStart(2, '0');
+            const d = String(date.getDate()).padStart(2, '0');
+            return `${y}-${m}-${d}`;
+        };
+
+        const formatCurrency = (amount) => {
+            const formatter = new Intl.NumberFormat('en-US', {
+                style: 'currency',
+                currency: 'USD',
+                signDisplay: 'exceptZero'
+            });
+            return formatter.format(amount);
+        };
+        
+        // --- API CALL WITH EXPONENTIAL BACKOFF ---
+        const fetchWithRetry = async (url, options, maxRetries = 5) => {
+            for (let i = 0; i < maxRetries; i++) {
+                try {
+                    const response = await fetch(url, options);
+                    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+                    return response;
+                } catch (error) {
+                    // Do not log retries as errors, only warnings
+                    // console.warn(`Attempt ${i + 1} failed: ${error.message}. Retrying...`);
+                    if (i === maxRetries - 1) throw error; // Re-throw on last attempt
+                    const delay = Math.pow(2, i) * 1000 + Math.random() * 1000; // Exponential delay + jitter
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+            }
+        };
+
+        // --- FINANCIAL TIP LOGIC (Daily Cache) ---
+
+        const displayTip = (tipText, sources) => {
+            let content = `
+                <h3 class="text-lg font-bold text-cyan-400 mb-2 flex items-center">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2 text-yellow-400" viewBox="0 0 20 20" fill="currentColor">
+                        <path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clip-rule="evenodd" />
+                    </svg>
+                    Daily Finance Insight
+                </h3>
+                <p class="text-gray-200 mb-3">${tipText}</p>
+            `;
+
+            if (sources.length > 0) {
+                // Only show the first source for brevity
+                const source = sources[0];
+                content += `
+                    <p class="text-xs text-gray-400 mt-2">
+                        Source: <a href="${source.uri}" target="_blank" class="text-cyan-300 hover:text-cyan-500 transition">${source.title || source.uri}</a>
+                    </p>
+                `;
+            }
+
+            tipWidgetEl.innerHTML = content;
+        };
+
+        const fetchFinancialTip = async () => {
+            const todayKey = formatDateKey(new Date());
+            // Use localStorage for simple daily cache check
+            const cachedTip = JSON.parse(localStorage.getItem('dailyFinancialTip'));
+
+            // 1. Check if we have a valid, unexpired tip for today
+            if (cachedTip && cachedTip.dateKey === todayKey) {
+                displayTip(cachedTip.text, cachedTip.sources || []);
+                return;
+            }
+
+            // 2. Display loading state if tip is expired or missing
+            tipWidgetEl.innerHTML = `
+                <div class="flex items-center text-cyan-400">
+                    <span class="loader w-4 h-4 mr-3 border-t-2"></span>
+                    <p>Fetching today's finance tip...</p>
+                </div>
+            `;
+
+            const systemPrompt = "You are a friendly and expert financial advisor. Provide one single, actionable, concise, short sentence financial tip relevant to personal budgeting, savings, or investing. Do not use markdown, lists, or line breaks.";
+            const userQuery = "Give me one simple, relevant financial tip for today.";
+
+            const payload = {
+                contents: [{ parts: [{ text: userQuery }] }],
+                tools: [{ "google_search": {} }], // Enable grounding
+                systemInstruction: {
+                    parts: [{ text: systemPrompt }]
+                },
+            };
+
+            const options = {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            };
+
+            try {
+                const response = await fetchWithRetry(apiUrlBase, options);
+                const result = await response.json();
+                
+                const candidate = result.candidates?.[0];
+
+                if (candidate && candidate.content?.parts?.[0]?.text) {
+                    const text = candidate.content.parts[0].text;
+                    let sources = [];
+                    
+                    const groundingMetadata = candidate.groundingMetadata;
+                    if (groundingMetadata && groundingMetadata.groundingAttributions) {
+                        sources = groundingMetadata.groundingAttributions
+                            .map(attribution => ({
+                                uri: attribution.web?.uri,
+                                title: attribution.web?.title,
+                            }))
+                            .filter(source => source.uri && source.title);
+                    }
+                    
+                    // 3. Display new tip and cache it
+                    displayTip(text, sources);
+                    localStorage.setItem('dailyFinancialTip', JSON.stringify({
+                        dateKey: todayKey,
+                        text: text,
+                        sources: sources
+                    }));
+
+                } else {
+                    displayTip("Could not fetch a tip right now. Check your network connection or try again later.", []);
+                    console.error("API response missing content:", result);
+                }
+
+            } catch (error) {
+                console.error("Failed to fetch financial tip after all retries:", error);
+                displayTip("Failed to load tip. Please try again later.", []);
+            }
+        };
+
+
+        // --- FIREBASE INITIALIZATION AND AUTHENTICATION ---
+        const initFirebase = async () => {
+            try {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                // Sign in with custom token or anonymously
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        userIdEl.textContent = `User ID: ${userId}`;
+                        isAuthReady = true;
+                        console.log("Firebase Auth Ready. User ID:", userId);
+                        
+                        // Initial render and data listening
+                        renderCalendar();
+                        setupDataListener();
+                        setupSavingsListener(); 
+                        setupDebtListener(); // ADDED: Start listening for debt balance
+
+                    } else {
+                        // User signed out or failed to sign in
+                        userId = null;
+                        userIdEl.textContent = 'User ID: N/A (Authentication Failed)';
+                        isAuthReady = true;
+                        loadingEl.classList.add('hidden');
+                        console.error("Firebase Auth state changed: No user.");
+                    }
+                });
+
+            } catch (error) {
+                console.error("Error initializing Firebase:", error);
+                loadingEl.classList.add('hidden');
+            }
+        };
+
+        // --- FIREBASE DATA HANDLING ---
+
+        const getDailyBalanceRef = (dateKey) => {
+            if (!db || !userId) return null;
+            // Private data path: /artifacts/{appId}/users/{userId}/daily_balances/{dateKey}
+            const collectionPath = `artifacts/${appId}/users/${userId}/daily_balances`;
+            return doc(db, collectionPath, dateKey);
+        };
+        
+        const getSavingsRef = () => {
+            if (!db || !userId) return null;
+            // Private data path: /artifacts/{appId}/users/{userId}/savings_balance/current
+            const collectionPath = `artifacts/${appId}/users/${userId}/savings_balance`;
+            return doc(db, collectionPath, 'current');
+        };
+
+        const getDebtRef = () => { // NEW: Reference to the single Debt Balance document
+            if (!db || !userId) return null;
+            // Private data path: /artifacts/{appId}/users/{userId}/debt_balance/current
+            const collectionPath = `artifacts/${appId}/users/${userId}/debt_balance`;
+            return doc(db, collectionPath, 'current');
+        };
+
+        const setupSavingsListener = () => { 
+            if (!db || !userId) return;
+            const docRef = getSavingsRef();
+            
+            onSnapshot(docRef, (doc) => {
+                const data = doc.data();
+                if (data && data.balance !== undefined && typeof data.balance === 'number') {
+                    currentSavingsBalance = data.balance;
+                } else {
+                    currentSavingsBalance = 0;
+                }
+                renderSavingsBalance();
+            }, (error) => {
+                console.error("Error listening to savings balance:", error);
+            });
+        };
+        
+        const setupDebtListener = () => { // NEW: Listener for the Debt Balance
+            if (!db || !userId) return;
+            const docRef = getDebtRef();
+            
+            onSnapshot(docRef, (doc) => {
+                const data = doc.data();
+                // Debt is stored as a negative number
+                if (data && data.balance !== undefined && typeof data.balance === 'number') {
+                    currentDebtBalance = data.balance;
+                } else {
+                    currentDebtBalance = 0;
+                }
+                renderDebtBalance();
+            }, (error) => {
+                console.error("Error listening to debt balance:", error);
+            });
+        };
+
+        const renderSavingsBalance = () => { 
+            savingsBalanceEl.textContent = formatCurrency(currentSavingsBalance);
+            savingsBalanceEl.className = 'text-2xl font-bold block ' + (currentSavingsBalance >= 0 ? 'text-emerald-400' : 'negative'); // Updated size
+        };
+        
+        const renderDebtBalance = () => { // NEW: Renders the debt balance in the widget
+            // Show the absolute (positive) amount of debt, but use negative styling
+            const amount = Math.abs(currentDebtBalance); 
+            debtBalanceEl.textContent = formatCurrency(amount);
+            debtBalanceEl.className = 'text-2xl font-bold negative block';
+        };
+
+
+        const setupDataListener = () => {
+            if (!db || !userId) {
+                console.warn("Firestore or User ID not available for data listener.");
+                return;
+            }
+
+            // Collection for daily balances under the current user
+            const collectionPath = `artifacts/${appId}/users/${userId}/daily_balances`;
+            const q = collection(db, collectionPath);
+            
+            // Listen for changes to the entire collection
+            onSnapshot(q, (snapshot) => {
+                const newCurrentMonthData = {}; 
+                let totalMonthlyBalance = 0;
+                
+                const allBalances = {}; 
+
+                snapshot.forEach(doc => {
+                    const data = doc.data();
+                    const dateKey = doc.id; 
+                    
+                    if (data.balance !== undefined && typeof data.balance === 'number') {
+                        allBalances[dateKey] = data.balance;
+                        
+                        const [docY, docM] = dateKey.split('-').map(Number);
+                        if (docY === currentYear && docM === (currentMonth + 1)) {
+                             newCurrentMonthData[dateKey] = data.balance;
+                             totalMonthlyBalance += data.balance;
+                        }
+                    }
+                });
+                
+                currentMonthData = newCurrentMonthData;
+                updateMonthlySummary(totalMonthlyBalance);
+                renderCalendar();
+                checkFutureBalanceWarning(allBalances); 
+                loadingEl.classList.add('hidden');
+                
+            }, (error) => {
+                console.error("Error listening to daily balances:", error);
+                loadingEl.classList.add('hidden');
+            });
+        };
+
+        const updateMonthlySummary = (total) => {
+            const isPositive = total >= 0;
+            monthlyBalanceEl.textContent = formatCurrency(total);
+            // Updated class names to reflect new size (text-2xl)
+            monthlyBalanceEl.className = isPositive 
+                ? 'text-2xl font-bold positive' 
+                : 'text-2xl font-bold negative';
+        };
+        
+        const saveBalance = async () => {
+            if (!db || !userId || (!selectedDate && modalMode === 'daily')) {
+                console.error("Cannot save: DB, User, or Selected Date/Modal Mode missing.");
+                return;
+            }
+
+            let balanceValue = parseFloat(balanceInputEl.value);
+
+            if (isNaN(balanceValue)) {
+                alertUser("Please enter a valid number for the balance.");
+                return;
+            }
+
+            balanceValue = Math.round(balanceValue * 100) / 100;
+            
+            let docRef;
+            let successMessage;
+
+            if (modalMode === 'savings') {
+                docRef = getSavingsRef();
+                successMessage = "Savings balance saved successfully!";
+            } else if (modalMode === 'debt') {
+                // Debt is saved as a NEGATIVE number for consistency
+                balanceValue = -Math.abs(balanceValue); 
+                docRef = getDebtRef();
+                successMessage = "Debt balance saved successfully!";
+            } else { // 'daily' mode
+                const dateKey = formatDateKey(selectedDate);
+                docRef = getDailyBalanceRef(dateKey);
+                successMessage = `Balance for ${dateKey} saved successfully!`;
+            }
+
+            try {
+                saveButton.innerHTML = '<span class="loader"></span> Saving...';
+                saveButton.disabled = true;
+
+                await setDoc(docRef, { 
+                    balance: balanceValue,
+                    ...(modalMode === 'daily' ? { date: formatDateKey(selectedDate) } : {}) 
+                }, { merge: true }); 
+
+                closeModal();
+                alertUser(successMessage);
+
+            } catch (error) {
+                console.error("Error saving document: ", error);
+                alertUser("Failed to save balance. Check console for details.");
+            } finally {
+                saveButton.innerHTML = 'Save Balance';
+                saveButton.disabled = false;
+            }
+        };
+
+        // --- BALANCE WARNING LOGIC ---
+        const checkFutureBalanceWarning = (allBalances) => {
+            const today = new Date();
+            let negativeDays = [];
+            let totalDeficit = 0;
+            const DAYS_TO_CHECK = 7;
+            
+            for (let i = 0; i < DAYS_TO_CHECK; i++) {
+                const date = new Date(today);
+                date.setDate(today.getDate() + i);
+                
+                const dateKey = formatDateKey(date);
+                const dayName = daysOfWeek[date.getDay()];
+                const dateNum = date.getDate();
+
+                const balance = allBalances[dateKey];
+                
+                if (balance !== undefined && balance < 0) {
+                    negativeDays.push({ dayName, dateNum, balance });
+                    totalDeficit += balance; 
+                }
+            }
+            
+            if (negativeDays.length > 0) {
+                const absoluteDeficit = Math.abs(totalDeficit); 
+                const dailyIncreaseNeeded = absoluteDeficit / DAYS_TO_CHECK;
+                
+                let messageHtml = `
+                    <div class="flex items-center mb-2">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 mr-3 text-red-300" viewBox="0 0 20 20" fill="currentColor">
+                            <path fill-rule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM10 11a1 1 0 100-2 1 1 0 000 2zm-1 4a1 1 0 112 0 1 1 0 01-2 0z" clip-rule="evenodd" />
+                        </svg>
+                        <h4 class="text-lg font-extrabold text-red-200">7-Day Financial Alert!</h4>
+                    </div>
+                `;
+
+                messageHtml += `<p class="mb-2 font-semibold">The total upcoming deficit is <span class="text-red-300">${formatCurrency(absoluteDeficit)}</span>.</p>`;
+
+                messageHtml += `<p class="text-sm mb-3 flex flex-wrap gap-2">Deficit days: ${negativeDays.map(day => 
+                    `<span class="bg-red-800 rounded-md px-2 py-0.5 whitespace-nowrap">${day.dayName} ${day.dateNum} (${formatCurrency(day.balance)})</span>`
+                ).join(' ')}</p>`;
+                
+                messageHtml += `
+                    <div class="p-3 bg-red-900 rounded-lg border-l-4 border-red-500">
+                        <p class="text-sm font-medium">🎯 **Actionable Tip:** To cover this deficit, aim to save or earn an average of 
+                        <span class="text-red-300 font-extrabold">${formatCurrency(dailyIncreaseNeeded)}</span> extra per day over the next ${DAYS_TO_CHECK} days.</p>
+                        <p class="text-xs mt-1 text-red-400">Review planned expenses on the deficit days to identify immediate savings opportunities.</p>
+                    </div>
+                `;
+
+                balanceWarningBannerEl.innerHTML = messageHtml;
+                balanceWarningBannerEl.classList.remove('hidden');
+            } else {
+                balanceWarningBannerEl.classList.add('hidden');
+            }
+        };
+
+
+        // --- CALENDAR RENDERING LOGIC ---
+
+        const renderCalendar = () => {
+            monthTitleEl.textContent = `${months[currentMonth]} ${currentYear}`;
+            calendarGridEl.innerHTML = '';
+            
+            const firstDayOfMonth = new Date(currentYear, currentMonth, 1);
+            const startingDayOfWeek = firstDayOfMonth.getDay(); // 0 for Sun, 6 for Sat
+            const daysInMonth = new Date(currentYear, currentMonth + 1, 0).getDate();
+
+            // 1. Render Day Headings (styles handled in CSS)
+            daysOfWeek.forEach(day => {
+                const header = document.createElement('div');
+                header.className = 'text-center font-semibold p-1 text-sm';
+                header.textContent = day;
+                calendarGridEl.appendChild(header);
+            });
+
+            // 2. Render Empty Days (padding at the start)
+            for (let i = 0; i < startingDayOfWeek; i++) {
+                const emptyCell = document.createElement('div');
+                emptyCell.className = 'day-cell empty-day bg-gray-900 border-gray-800'; 
+                calendarGridEl.appendChild(emptyCell);
+            }
+
+            // 3. Render Actual Days
+            for (let day = 1; day <= daysInMonth; day++) {
+                const date = new Date(currentYear, currentMonth, day);
+                const dateKey = formatDateKey(date);
+                const balance = currentMonthData[dateKey]; 
+                
+                const cell = document.createElement('div');
+                cell.className = 'day-cell flex flex-col items-start p-1 relative';
+                
+                const today = new Date();
+                const isToday = dateKey === formatDateKey(today);
+
+                if (isToday) {
+                    cell.classList.add('bg-yellow-800', 'border-yellow-700');
+                }
+
+                if (selectedDate && dateKey === formatDateKey(selectedDate)) {
+                    cell.classList.add('selected-day');
+                }
+
+                // Day Number
+                const dayNum = document.createElement('div');
+                dayNum.className = 'text-sm sm:text-base font-bold text-gray-200 mb-0 leading-none';
+                dayNum.textContent = day;
+                cell.appendChild(dayNum);
+
+                // Balance Display
+                const balanceEl = document.createElement('div');
+                
+                if (balance !== undefined) {
+                    const formattedBalance = formatCurrency(balance);
+                    const isPositive = balance >= 0;
+                    
+                    balanceEl.className = `balance-amount my-0 leading-none ${isPositive ? 'positive' : 'negative'}`; 
+                    balanceEl.textContent = formattedBalance;
+                } else {
+                    balanceEl.className = 'balance-amount text-gray-500 my-0 leading-none';
+                    balanceEl.textContent = '—';
+                }
+                
+                cell.appendChild(balanceEl);
+
+                // Click handler
+                cell.addEventListener('click', () => openModal(date));
+                calendarGridEl.appendChild(cell);
+            }
+        };
+
+        const changeMonth = (delta) => {
+            currentMonth += delta;
+            if (currentMonth > 11) {
+                currentMonth = 0;
+                currentYear++;
+            } else if (currentMonth < 0) {
+                currentMonth = 11;
+                currentYear--;
+            }
+            renderCalendar(); 
+        };
+
+        // --- MODAL AND UI HANDLING (MODIFIED for Debt) ---
+
+        const openModal = (dateOrMode) => { // Handles Date object or string 'savings'/'debt'
+            if (!isAuthReady) {
+                alertUser("Please wait, the application is still connecting...");
+                return;
+            }
+
+            if (dateOrMode === 'savings') {
+                modalMode = 'savings';
+                selectedDate = null;
+                
+                document.getElementById('modal-title').textContent = 'Edit Total Savings';
+                modalDateEl.textContent = 'Enter your current total savings amount.';
+                balanceInputEl.value = currentSavingsBalance !== 0 ? currentSavingsBalance : '';
+            } else if (dateOrMode === 'debt') { 
+                modalMode = 'debt';
+                selectedDate = null;
+
+                document.getElementById('modal-title').textContent = 'Edit Total Debt';
+                modalDateEl.textContent = 'Enter your current total debt amount (as a positive number).';
+                // Show the positive value for editing
+                balanceInputEl.value = Math.abs(currentDebtBalance) !== 0 ? Math.abs(currentDebtBalance) : ''; 
+
+            } else { // Daily balance mode (Date object)
+                modalMode = 'daily';
+                selectedDate = dateOrMode;
+                const dateKey = formatDateKey(selectedDate);
+                const balance = currentMonthData[dateKey];
+                
+                document.getElementById('modal-title').textContent = 'Edit Daily Balance';
+                modalDateEl.textContent = selectedDate.toDateString();
+                balanceInputEl.value = balance !== undefined ? balance : '';
+            }
+            
+            modalEl.classList.remove('hidden');
+            balanceInputEl.focus();
+        };
+
+        const closeModal = () => {
+            selectedDate = null;
+            modalMode = 'daily'; // Reset modal state
+            modalEl.classList.add('hidden');
+            renderCalendar(); 
+        };
+        
+        const alertUser = (message) => {
+            // Simple visual feedback instead of alert()
+            const alertBox = document.getElementById('app-alert');
+            // Updated alert color
+            alertBox.classList.remove('bg-indigo-600');
+            alertBox.classList.add('bg-cyan-500');
+            alertBox.textContent = message;
+            alertBox.classList.remove('hidden', 'opacity-0');
+            alertBox.classList.add('opacity-100');
+
+            setTimeout(() => {
+                alertBox.classList.remove('opacity-100');
+                alertBox.classList.add('opacity-0');
+                // Use a short delay before hiding fully to allow for transition
+                setTimeout(() => alertBox.classList.add('hidden'), 300);
+            }, 3000);
+        };
+
+
+        // --- EVENT LISTENERS AND INITIALIZATION ---
+        window.onload = function () {
+            // Initial call to set up Firebase and start the app
+            initFirebase();
+            
+            // FETCH THE FINANCIAL TIP
+            fetchFinancialTip();
+            
+            // NEW LISTENER for the Savings Widget
+            savingsWidgetEl.addEventListener('click', () => openModal('savings'));
+            // NEW LISTENER for the Debt Widget
+            document.getElementById('debt-widget').addEventListener('click', () => openModal('debt')); 
+            
+            // Setup buttons
+            document.getElementById('prev-month-btn').addEventListener('click', () => changeMonth(-1));
+            document.getElementById('next-month-btn').addEventListener('click', () => changeMonth(1));
+            document.getElementById('close-modal-btn').addEventListener('click', closeModal);
+            document.getElementById('save-balance-btn').addEventListener('click', saveBalance);
+            
+            // Handle saving on Enter key in the input field
+            balanceInputEl.addEventListener('keypress', function (e) {
+                if (e.key === 'Enter') {
+                    saveBalance();
+                }
+            });
+            
+            loadingEl.classList.remove('hidden');
+        };
+        
+        // Export functions to the global scope for use in the HTML button clicks
+        window.changeMonth = changeMonth;
+        window.closeModal = closeModal; // In case the modal container is clicked
+    </script>
+</head>
+<body class="bg-gray-900 min-h-screen">
+
+    <!-- Global Alert/Notification Box (Updated color) -->
+    <div id="app-alert" class="hidden opacity-0 transition-opacity duration-300 fixed top-4 right-4 bg-cyan-500 text-white p-3 rounded-lg shadow-xl z-[60] font-medium">
+        Message
+    </div>
+
+    <div class="max-w-4xl mx-auto p-4 sm:p-8 text-gray-100">
+        
+        <header class="text-center mb-6">
+            <!-- Updated heading color -->
+            <h1 class="text-3xl sm:text-4xl font-extrabold text-white mb-2">💰 Daily Balance Tracker</h1>
+            <p class="text-gray-400">Click any day to log your balance (e.g., daily profit/loss, spending, or savings).</p>
+            <!-- Updated ID box for dark mode -->
+            <div class="text-sm mt-1 p-1 bg-gray-800 rounded-lg text-gray-300 shadow-inner" id="user-id-display">
+                Connecting to database...
+            </div>
+        </header>
+
+        <!-- NEW FINANCIAL TIP WIDGET -->
+        <div id="tip-widget" class="mb-6 p-4 bg-gray-700 rounded-xl shadow-lg border border-cyan-800 min-h-[70px]">
+            <!-- Content dynamically loaded by fetchFinancialTip -->
+            <div class="flex items-center text-cyan-400">
+                <span class="loader w-4 h-4 mr-3 border-t-2"></span>
+                <p>Fetching today's finance tip...</p>
+            </div>
+        </div>
+        
+        <!-- NEW WARNING BANNER (Red/Alarm Style with Actionable Tip) -->
+        <div id="balance-warning-banner" class="hidden mb-6 p-4 rounded-xl shadow-lg border border-red-700 bg-red-900/50 text-red-200">
+            <!-- Content injected by JS -->
+        </div>
+
+        <!-- Loading Indicator -->
+        <div id="loading-indicator" class="hidden text-center py-10">
+            <div class="loader mx-auto mb-3"></div>
+            <p class="text-cyan-400 font-medium">Loading data from Firestore...</p>
+        </div>
+
+        <!-- Main Content Card (Updated for dark mode) -->
+        <main id="app-content" class="bg-gray-800 rounded-xl shadow-2xl p-4 sm:p-6 shadow-cyan-900/50">
+            
+            <!-- NEW: Top Metrics Bar (Monthly Net, Savings, Debt) -->
+            <div class="flex flex-wrap justify-center sm:justify-between items-stretch gap-4 mb-6 p-3 bg-gray-700 rounded-xl shadow-inner border border-gray-600">
+                
+                <!-- Monthly Net Display -->
+                <div class="flex flex-col items-center p-2 rounded-lg bg-gray-800 flex-grow min-w-[120px] shadow-md">
+                    <p class="text-xs text-gray-400 uppercase font-semibold">Monthly Net</p>
+                    <span id="monthly-balance" class="text-2xl font-bold text-gray-200">$0.00</span>
+                </div>
+
+                <!-- SAVINGS WIDGET (Clickable) -->
+                <div id="savings-widget" class="p-2 px-4 rounded-lg bg-gray-800 shadow-md cursor-pointer hover:bg-gray-600 transition flex-grow min-w-[120px] flex flex-col items-center justify-center">
+                    <p class="text-xs text-gray-400 uppercase font-semibold">Total Savings</p>
+                    <span id="savings-balance" class="text-2xl font-bold text-emerald-400 block">Loading...</span>
+                </div>
+                
+                <!-- DEBT WIDGET (NEW Clickable) -->
+                <div id="debt-widget" class="p-2 px-4 rounded-lg bg-gray-800 shadow-md cursor-pointer hover:bg-gray-600 transition flex-grow min-w-[120px] flex flex-col items-center justify-center">
+                    <p class="text-xs text-gray-400 uppercase font-semibold">Total Debt</p>
+                    <!-- Note: Debt amount is shown as positive, but uses the red styling -->
+                    <span id="debt-balance" class="text-2xl font-bold negative block">Loading...</span> 
+                </div>
+                
+            </div>
+
+            <!-- Calendar Header (Simplified) -->
+            <div class="flex justify-between items-center mb-4">
+                <!-- Previous Month Button -->
+                <button id="prev-month-btn" class="p-2 rounded-full bg-gray-700 hover:bg-cyan-500 transition shadow-lg" aria-label="Previous Month">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-cyan-400 hover:text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
+                    </svg>
+                </button>
+                
+                <div class="text-center">
+                    <h2 id="month-title" class="text-2xl font-bold text-cyan-400"></h2>
+                </div>
+
+                <!-- Next Month Button -->
+                <button id="next-month-btn" class="p-2 rounded-full bg-gray-700 hover:bg-cyan-500 transition shadow-lg" aria-label="Next Month">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-cyan-400 hover:text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+                    </svg>
+                </button>
+            </div>
+
+            <!-- Calendar Grid -->
+            <div id="calendar-grid" class="calendar-grid w-full rounded-lg overflow-hidden border border-gray-700">
+                <!-- Calendar content generated by JavaScript -->
+            </div>
+        </main>
+    </div>
+
+    <!-- Balance Modal (content remains white for high contrast) -->
+    <div id="balance-modal" class="modal-container hidden" onclick="if(event.target.id === 'balance-modal') closeModal()">
+        <div class="modal-content">
+            <h3 id="modal-title" class="text-xl font-semibold text-gray-800 mb-4">Edit Daily Balance</h3>
+            
+            <p id="modal-date" class="text-cyan-600 font-medium mb-4"></p>
+            
+            <div class="mb-4">
+                <label for="balance-input" class="block text-sm font-medium text-gray-700 mb-1">Balance Amount ($)</label>
+                <!-- Input field style refinement -->
+                <input type="number" step="0.01" id="balance-input" placeholder="e.g., 50.75 or -10.00" 
+                       class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-3 border focus:border-cyan-500 focus:ring-cyan-500">
+            </div>
+
+            <div class="flex justify-end space-x-3">
+                <button id="close-modal-btn" type="button" 
+                        class="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200 transition shadow-sm">
+                    Cancel
+                </button>
+                <!-- Updated save button color -->
+                <button id="save-balance-btn" type="button" 
+                        class="px-4 py-2 text-sm font-medium text-white bg-cyan-600 rounded-lg hover:bg-cyan-700 transition shadow-md flex items-center justify-center min-w-[100px]">
+                    Save Balance
+                </button>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
